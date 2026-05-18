@@ -1,28 +1,26 @@
 # terraform-azurerm-nomos-bootstrap
 
 Bootstrap an Azure tenant to trust the Nomos OIDC issuer. Creates an App
-Registration + federated identity credential + a Reader role assignment so
+Registration + federated identity credentials + a Reader role assignment so
 the Nomos PDP can broker short-lived access tokens for agent requests
 against `management.azure.com`.
-
-> **Preview (2026-05-15):** no public mirror yet. Source this module from
-> a local path that points at `infra/terraform/azurerm-nomos-bootstrap/` in
-> the Nomos repo, or copy the directory into your own Terraform repo and
-> pin to a commit SHA. The CLI emits a working snippet automatically:
-> `nomos cloud install --azure --customer-id <id> --nomos-oidc-issuer <url>`.
 
 ## Usage
 
 ```hcl
 module "nomos" {
-  # Preview: local-path source. Adjust the relative path to wherever
-  # you cloned the credential-broker repo.
-  source = "../credential-broker/infra/terraform/azurerm-nomos-bootstrap"
+  source = "git::https://github.com/varendra007/nomos-terraforms.git//azurerm-nomos-bootstrap?ref=main"
 
-  customer_id       = "your-nomos-customer-uuid"      # from /app/settings/workspace
-  subscription_id   = "00000000-0000-0000-0000-000000000000"
-  nomos_oidc_issuer = "https://<your-issuer-host>"    # URL of the OIDC issuer you deployed
-                                                      # (see apps/oidc-issuer/)
+  customer_id     = "your-nomos-customer-uuid"          # from /app/settings/workspace
+  subscription_id = "00000000-0000-0000-0000-000000000000"
+
+  # Add real agent_ids here as you create agents in the Nomos dashboard.
+  # One federated credential is created per id; Azure caps total at 20.
+  # The "verify-poll" id is always included automatically.
+  additional_agent_ids = [
+    # "agt_01H9XYZ...",
+    # "agt_01HABCD...",
+  ]
 
   # Optional — narrow to one RG instead of subscription scope:
   # resource_group_name = "rg-agent-sandbox"
@@ -44,7 +42,7 @@ output "nomos_paste_into_dashboard" {
 |---|---|
 | `azuread_application.nomos` | App Registration the federation trusts. |
 | `azuread_service_principal.nomos` | SP the role assignment binds to. |
-| `azuread_application_federated_identity_credential.nomos` | Trust block — issuer = `id.auto-nomos.com`, subject = `customer/{id}/agent/*`. |
+| `azuread_application_federated_identity_credential.nomos` (per agent_id) | Trust block — issuer = Nomos OIDC, subject = exact `customer/{cid}/agent/{agent_id}`. |
 | `azurerm_role_assignment.nomos` | Reader at subscription or RG scope. |
 
 ## Variables
@@ -53,11 +51,11 @@ output "nomos_paste_into_dashboard" {
 |---|---|---|
 | `customer_id` | Nomos customer id. Required. | — |
 | `subscription_id` | Azure subscription id. Required. | — |
+| `additional_agent_ids` | Extra agent_ids that should be allowed (one FIC each). | `[]` |
 | `nomos_oidc_issuer` | Public Nomos issuer URL. | `https://id.auto-nomos.com` |
 | `resource_group_name` | Narrow Reader to one RG. Empty = subscription scope. | `""` |
 | `app_display_name` | App Registration display name. | `nomos-agent-broker` |
-| `role_definition_name` | Built-in role to assign. M1 = Reader. | `Reader` |
-| `agent_subject` | Override federated cred subject (rarely needed). | `customer/{id}/agent/*` |
+| `role_definition_name` | Built-in role to assign. | `Reader` |
 
 ## Outputs
 
@@ -68,29 +66,28 @@ Paste these into the Nomos dashboard at `/app/cloud/connect/azure`:
 - `tenant_id`
 - `subscription_id`
 
+`agent_ids_with_credentials` is also emitted for verification.
+
 ## How the federation works
 
-1. Nomos mints an OIDC ID token signed by an RS256 key. In preview the
-   signer can be in-memory (dev) or AWS KMS-backed (`OIDC_KMS_KEY_REF`).
-2. Token claims include `iss=<your nomos_oidc_issuer>`, `sub=customer/{id}/agent/{agent_id}`,
-   `aud=api://AzureADTokenExchange`.
-3. Nomos POSTs the token to `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`
-   with `grant_type=client_credentials`, `client_assertion_type=...:jwt-bearer`,
-   `client_assertion=<id-token>`, `scope=https://management.azure.com/.default`.
-4. AAD validates the token against `<your nomos_oidc_issuer>/.well-known/openid-configuration`
-   and the federated identity credential on the App Registration, returns
-   an AAD access token.
+1. Nomos mints an OIDC ID token signed by an RS256 key.
+2. Token claims include `iss=https://id.auto-nomos.com`, `sub=customer/{cid}/agent/{agent_id}`, `aud=api://AzureADTokenExchange`.
+3. Nomos POSTs the token to `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` with `grant_type=client_credentials`, `client_assertion_type=...:jwt-bearer`, `client_assertion=<id-token>`, `scope=https://management.azure.com/.default`.
+4. AAD validates the token against `id.auto-nomos.com/.well-known/openid-configuration` and the federated identity credential whose subject exactly matches `customer/{cid}/agent/{agent_id}`, returns an AAD access token.
 5. PDP attaches the AAD token as `Authorization: Bearer` to ARM calls.
 
-No long-lived secrets leave the customer's tenant. Nomos never holds a
-client secret or service-principal password.
+No long-lived secrets leave the customer's tenant. Nomos never holds a client secret or service-principal password.
 
-## Limits
+## Important — Azure federated credential constraints
 
-- Azure caps federated credentials at **20 per app**. M1 uses a single
-  wildcard subject (`customer/{id}/agent/*`); customers with >20 agents
-  per tenant should upgrade to flexible federated identity credentials
-  (M2).
-- Reader is the broadest role this module assigns. To do writes you'll
-  add additional `azurerm_role_assignment` blocks in your own Terraform —
-  the M1 module intentionally restricts to read.
+- **No wildcards.** Subject must be an exact string match. `customer/{cid}/agent/*` does **not** behave as a wildcard — Azure treats `*` as a literal character and rejects all tokens.
+- **Flexible FIC blocked for custom issuers.** Microsoft Entra ID restricts `claimsMatchingExpression` to a small set of trusted issuers (GitHub, Terraform Cloud, etc.) — it returns `Expression is not supported for applications in this cloud 'Public' using issuer 'https://id.auto-nomos.com'`. This module therefore creates one exact-match FIC per agent_id.
+- **20-credential cap per app.** If you need more than 20 agents talking to Azure under the same customer, deploy this module twice (two App Registrations) or split agents across multiple Azure subscriptions.
+
+## Adding a new agent later
+
+Append the agent_id to `additional_agent_ids` and re-run `terraform apply`. The module will create the additional FIC without touching the rest.
+
+## Customising the role
+
+`role_definition_name = "Reader"` is the safest default. To allow writes, change it (e.g. `"Contributor"`) or add separate `azurerm_role_assignment` blocks in your own Terraform that bind to `module.nomos.app_object_id`.

@@ -2,14 +2,19 @@
 #
 # Creates everything an Azure tenant needs to trust the Nomos OIDC issuer:
 #   - App Registration + Service Principal
-#   - Federated identity credential (issuer = id.auto-nomos.com)
+#   - Federated identity credentials (one per agent_id)
 #   - Role assignment (Reader by default; narrow scope via vars)
 #
-# Outputs feed the Nomos dashboard cloud-account form.
+# IMPORTANT — Azure federated identity credential constraints:
+#   - Subject must be an EXACT string. Wildcards are NOT supported.
+#   - Flexible FIC (claimsMatchingExpression) is restricted to a small set
+#     of Microsoft-trusted issuers (GitHub, Terraform Cloud, etc.) and is
+#     blocked for custom OIDC issuers like id.auto-nomos.com.
+#   - Hard cap of 20 federated credentials per App Registration.
 #
-# Final home: github.com/auto-nomos/terraform-azurerm-nomos-bootstrap
-# This monorepo copy is the source of truth during M1; we publish to the
-# public repo once M1 lands on main.
+# This module always provisions a FIC for the `verify-poll` agent so the
+# /app/cloud "Verify now" probe succeeds. Pass `additional_agent_ids` to
+# create one FIC per real agent that will call Azure through Nomos.
 
 provider "azurerm" {
   features {}
@@ -17,32 +22,25 @@ provider "azurerm" {
 }
 
 variable "nomos_oidc_issuer" {
-  description = "Public URL of the Nomos OIDC issuer. Pinned via the dashboard wizard."
+  description = "Public URL of the Nomos OIDC issuer."
   type        = string
   default     = "https://id.auto-nomos.com"
 }
 
 variable "customer_id" {
-  description = "Nomos customer id — appears in the federated cred subject pattern."
+  description = "Nomos customer id — embedded in every federated cred subject."
   type        = string
 }
 
-variable "agent_subject" {
-  description = "Federated cred subject. M1 supports one cred per agent (Azure caps flexible FIC at 20/app)."
-  type        = string
-  default     = "customer/UNUSED/agent/UNUSED"
-}
-
-variable "use_flexible_fic" {
-  description = "M2 — use flexible federated identity credentials (claims-matching). Required for tenants with >20 agents."
-  type        = bool
-  default     = false
-}
-
-variable "fic_claims_match" {
-  description = "When use_flexible_fic=true, the claims-matching expression evaluated against the OIDC token. Default matches any agent under this customer."
-  type        = string
-  default     = ""
+variable "additional_agent_ids" {
+  description = <<-EOT
+    List of agent_ids that should be allowed to call Azure through this app.
+    One federated identity credential is created per id (subject =
+    customer/{customer_id}/agent/{agent_id}). The `verify-poll` id is
+    always added. Azure caps the total at 20 credentials per app.
+  EOT
+  type        = list(string)
+  default     = []
 }
 
 variable "subscription_id" {
@@ -63,7 +61,7 @@ variable "app_display_name" {
 }
 
 variable "role_definition_name" {
-  description = "Built-in role to assign. Reader is sufficient for M1 read-only MVP."
+  description = "Built-in role to assign. Reader is sufficient for read-only access."
   type        = string
   default     = "Reader"
 }
@@ -79,59 +77,23 @@ resource "azuread_service_principal" "nomos" {
   client_id = azuread_application.nomos.client_id
 }
 
-# ----- Federated credential -----
+# ----- Federated credentials -----
 #
-# Subject format Nomos asserts: customer/{customer_id}/agent/{agent_id}
-# Azure cap: 20 federated credentials per app. For M1 we ship one
-# per agent; M2 swaps to flexible federated identity credentials with
-# claims pattern matching.
+# One FIC per agent_id. `verify-poll` is always included so the dashboard
+# "Verify now" button succeeds. Add real agent_ids via `additional_agent_ids`.
 
-# Subject-pattern federated cred (M1 default). Capped at 20 per app.
+locals {
+  agent_ids = toset(concat(["verify-poll"], var.additional_agent_ids))
+}
+
 resource "azuread_application_federated_identity_credential" "nomos" {
-  count          = var.use_flexible_fic ? 0 : 1
+  for_each       = local.agent_ids
   application_id = azuread_application.nomos.id
-  display_name   = "nomos-${var.customer_id}"
+  display_name   = "nomos-${var.customer_id}-${each.value}"
   description    = "Trusts Nomos OIDC issuer to assert agent identity"
   audiences      = ["api://AzureADTokenExchange"]
   issuer         = var.nomos_oidc_issuer
-  subject = (
-    var.agent_subject == "customer/UNUSED/agent/UNUSED"
-    ? "customer/${var.customer_id}/agent/*"
-    : var.agent_subject
-  )
-}
-
-# M2 — flexible federated identity credentials with claims-matching.
-# One trust block matches arbitrarily many agents via claim conditions
-# instead of fixed subject strings. Required for tenants >20 agents.
-#
-# Azure provider doesn't yet expose a dedicated FIC resource — we use the
-# REST API directly via azapi to set `claimsMatchingExpression`. Customer
-# must declare azapi provider in their root module:
-#
-#   terraform {
-#     required_providers {
-#       azapi = { source = "Azure/azapi", version = "~> 1.0" }
-#     }
-#   }
-#
-# `fic_claims_match` defaults to matching any agent under this customer.
-resource "azapi_resource" "nomos_fic" {
-  count                    = var.use_flexible_fic ? 1 : 0
-  schema_validation_enabled = false
-  type                     = "Microsoft.Graph/applications/federatedIdentityCredentials@v1.0"
-  name      = "nomos-fic-${var.customer_id}"
-  parent_id = "applications/${azuread_application.nomos.object_id}"
-
-  body = jsonencode({
-    name      = "nomos-fic-${var.customer_id}"
-    issuer    = var.nomos_oidc_issuer
-    audiences = ["api://AzureADTokenExchange"]
-    claimsMatchingExpression = {
-      languageVersion = 1
-      value           = var.fic_claims_match == "" ? "claims['nomos']['customer_id'] eq '${var.customer_id}'" : var.fic_claims_match
-    }
-  })
+  subject        = "customer/${var.customer_id}/agent/${each.value}"
 }
 
 # ----- Role assignment -----
@@ -180,4 +142,9 @@ output "subscription_id" {
 output "role_scope" {
   description = "Scope at which Reader was assigned."
   value       = local.role_scope
+}
+
+output "agent_ids_with_credentials" {
+  description = "All agent_ids that have a federated identity credential on this app."
+  value       = sort(tolist(local.agent_ids))
 }
