@@ -88,6 +88,23 @@ No long-lived secrets leave the customer's tenant. Nomos never holds a client se
 
 Append the agent_id to `additional_agent_ids` and re-run `terraform apply`. The module will create the additional FIC without touching the rest.
 
+> **This is not optional.** Azure rejects every token whose subject doesn't match a registered FIC with `AADSTS700213: No matching federated identity record found`. The Nomos dashboard surfaces the exact `az` command for each new app you register, but the credential has to live in your tenant — Nomos cannot create it on your behalf.
+
+### One-shot Azure CLI (alternative to re-running Terraform)
+
+```bash
+az ad app federated-credential create \
+  --id <app_object_id> \
+  --parameters '{
+    "name": "nomos-<short-agent-name>",
+    "issuer": "https://id.auto-nomos.com",
+    "subject": "customer/<your-customer-id>/agent/<agent_id>",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+```
+
+Both the dashboard agent detail page and `terraform output agent_ids_with_credentials` give you the agent_id values to plug in.
+
 ## Customising the role
 
 `role_definition_name = "Reader"` is the safest default. To allow writes, change it (e.g. `"Contributor"`) or add separate `azurerm_role_assignment` blocks in your own Terraform that bind to `module.nomos.app_object_id`.

@@ -18,6 +18,8 @@ No client secrets are stored. Nomos mints a short-lived OIDC token per agent req
 
 Azure federated identity credentials require **exact subject matches** — wildcards are not supported, and Microsoft blocks `claimsMatchingExpression` for custom OIDC issuers. The module therefore creates one FIC per agent_id (Azure cap: 20 per app). The `verify-poll` id is always included so the dashboard "Verify now" button works; add real agent ids via `additional_agent_ids` as you create agents in Nomos.
 
+> **Each app you register on Nomos needs a matching FIC.** If you skip this, the agent gets `AADSTS700213: No matching federated identity record found` on every Azure call. The Nomos app detail page shows the exact `az` / Terraform snippet pre-filled — copy-paste it after creating each app.
+
 ```hcl
 module "nomos_azure" {
   source = "git::https://github.com/varendra007/nomos-terraforms.git//azurerm-nomos-bootstrap?ref=main"
